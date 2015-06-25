@@ -171,8 +171,10 @@ void P2PSync<Dtype>::SetupP2PAccess() {
   CUDA_CHECK(cudaSetDevice(self));
 
   cudaStreamCreateWithFlags(&cuda_stream_, cudaStreamNonBlocking);
-  //cuda_stream_ = cudaStreamDefault;
-  //cudaStreamCreate(&cuda_stream_);
+
+  CUDA_CHECK(cudaMalloc(&parent_grads_, size_ * sizeof(Dtype)));
+  CUDA_CHECK(cudaMalloc(&offset_, GRID_DIM*sizeof(int)));
+  CUDA_CHECK(cudaMemset(offset_, -1, GRID_DIM*sizeof(int)));
 
   if (parent_) {
     // Enable p2p access between devices
@@ -185,10 +187,6 @@ void P2PSync<Dtype>::SetupP2PAccess() {
       CHECK(false) << "Fatal : P2P access is needed between all GPUs for pipeline";
     }
   }
-
-  CUDA_CHECK(cudaMalloc(&parent_grads_, size_ * sizeof(Dtype)));
-  CUDA_CHECK(cudaMalloc(&offset_, GRID_DIM*sizeof(int)));
-  CUDA_CHECK(cudaMemset(offset_, -1, GRID_DIM*sizeof(int)));
 
   if (child_) {
     const int peer = child_->solver_->param().device_id();
@@ -215,6 +213,10 @@ P2PSync<Dtype>::~P2PSync() {
   CUDA_CHECK(cudaSetDevice(self));
 
   cudaStreamDestroy(cuda_stream_);
+
+  CUDA_CHECK(cudaFree(parent_grads_));
+  CUDA_CHECK(cudaFree(offset_));
+
   if (child_) {
     const int peer = child_->solver_->param().device_id();
     int access;
