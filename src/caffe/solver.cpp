@@ -184,11 +184,21 @@ void Solver<Dtype>::Step(int iters) {
   Timer timer;
   ostringstream timing;
 
+  // We need to sync all threads before starting, otherwise some cuda init,
+  // malloc or other cuda stuff could interlock with in-loop cuda GPU sync
+  // called in on_start and on_gradients_ready.
+  for (int i = 0; i < callbacks_.size(); ++i) {
+    callbacks_[i]->soft_barrier();
+  }
+
   while (iter_ < stop_iter) {
     if (param_.test_interval() && iter_ % param_.test_interval() == 0
-        && (iter_ > 0 || param_.test_initialization())
-        && Caffe::root_solver()) {
-      TestAll();
+        && (iter_ > 0 || param_.test_initialization())) {
+        if (Caffe::root_solver()) TestAll();
+        // Better wait here than busy poll in GPU
+        for (int i = 0; i < callbacks_.size(); ++i) {
+          callbacks_[i]->soft_barrier();
+        }
     }
 
     timer.Start();

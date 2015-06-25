@@ -43,6 +43,7 @@ class Solver {
   // Invoked at specific points during an iteration
   class Callback {
    protected:
+    virtual void soft_barrier() = 0;
     virtual void on_start(Timer* timer, ostringstream* timing) = 0;
     virtual void on_gradients_ready(Timer* timer, ostringstream* timing) = 0;
 

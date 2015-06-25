@@ -99,16 +99,21 @@ class P2PSync : public GPUParams<Dtype>, public Solver<Dtype>::Callback,
   static void divide_batch_size(NetParameter* net);
 
  protected:
+  void SetupP2PAccess();
+
+  void soft_barrier();
   void on_start(Timer* timer, ostringstream* timing);
   void on_gradients_ready(Timer* timer, ostringstream* timing);
 
   void InternalThreadEntry();
 
   P2PSync<Dtype>* parent_;
-  vector<P2PSync<Dtype>*> children_;
+  P2PSync<Dtype>* child_;
   BlockingQueue<P2PSync<Dtype>*> queue_;
   const int initial_iter_;
   Dtype* parent_grads_;
+  cudaStream_t cuda_stream_;
+  int *offset_;
   shared_ptr<Solver<Dtype> > solver_;
 
   using Params<Dtype>::size_;

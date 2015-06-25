@@ -15,6 +15,9 @@
 #include "boost/thread.hpp"
 #include "caffe/caffe.hpp"
 #include "caffe/parallel.hpp"
+#include "caffe/util/coll.h"
+
+#define GRID_DIM 8
 
 namespace caffe {
 
@@ -117,67 +120,9 @@ void GPUParams<Dtype>::configure(Solver<Dtype>* solver) const {
 
 void DevicePair::compute(const vector<int> devices, vector<DevicePair>* pairs) {
 #ifndef CPU_ONLY
-  vector<int> remaining(devices);
-
-  // Group GPUs by board
-  for (int i = 0; i < remaining.size(); ++i) {
-    for (int j = i + 1; j < remaining.size(); ++j) {
-      cudaDeviceProp a, b;
-      CUDA_CHECK(cudaGetDeviceProperties(&a, remaining[i]));
-      CUDA_CHECK(cudaGetDeviceProperties(&b, remaining[j]));
-      if (a.isMultiGpuBoard && b.isMultiGpuBoard) {
-        if (a.multiGpuBoardGroupID == b.multiGpuBoardGroupID) {
-          pairs->push_back(DevicePair(remaining[i], remaining[j]));
-          DLOG(INFO) << "GPU board: " << remaining[i] << ":" << remaining[j];
-          remaining.erase(remaining.begin() + j);
-          break;
-        }
-      }
-    }
-  }
-  ostringstream s;
-  for (int i = 0; i < remaining.size(); ++i) {
-    s << (i ? ", " : "") << remaining[i];
-  }
-  DLOG(INFO) << "GPUs paired by boards, remaining: " << s.str();
-
-  // Group by P2P accessibility
-  for (int i = 0; i < remaining.size(); ++i) {
-    for (int j = i + 1; j < remaining.size(); ++j) {
-      int access;
-      CUDA_CHECK(cudaDeviceCanAccessPeer(&access, remaining[i], remaining[j]));
-      if (access) {
-        pairs->push_back(DevicePair(remaining[i], remaining[j]));
-        DLOG(INFO) << "P2P pair: " << remaining[i] << ":" << remaining[j];
-        remaining.erase(remaining.begin() + j);
-        break;
-      }
-    }
-  }
-  s.str("");
-  for (int i = 0; i < remaining.size(); ++i) {
-    s << (i ? ", " : "") << remaining[i];
-  }
-  DLOG(INFO) << "GPUs paired by P2P access, remaining: " << s.str();
-
-  // Group remaining
-  for (int i = 0; i < remaining.size(); ++i) {
-    for (int j = i + 1; j < remaining.size(); ++j) {
-      pairs->push_back(DevicePair(remaining[i], remaining[j]));
-      DLOG(INFO) << "Remaining pair: " << remaining[i] << ":" << remaining[j];
-      remaining.erase(remaining.begin() + j);
-      break;
-    }
-  }
-  CHECK_EQ(remaining.size(), 1);
-  pairs->insert(pairs->begin(), DevicePair(-1, remaining[0]));
-
-  CHECK(pairs->size() == devices.size());
-  for (int i = 0; i < pairs->size(); ++i) {
-    CHECK((*pairs)[i].parent() != (*pairs)[i].device());
-    for (int j = i + 1; j < pairs->size(); ++j) {
-      CHECK((*pairs)[i].device() != (*pairs)[j].device());
-    }
+  pairs->push_back(DevicePair(-1, devices[0]));
+  for (int i=0; i < devices.size()-1; i++) {
+    pairs->push_back(DevicePair(devices[i], devices[i+1]));
   }
 #else
   NO_GPU;
@@ -191,7 +136,7 @@ P2PSync<Dtype>::P2PSync(shared_ptr<Solver<Dtype> > root_solver,
                         P2PSync<Dtype>* parent, const SolverParameter& param)
     : GPUParams<Dtype>(root_solver, param.device_id()),
       parent_(parent),
-      children_(),
+      child_(),
       queue_(),
       initial_iter_(root_solver->iter()),
       solver_() {
@@ -211,22 +156,50 @@ P2PSync<Dtype>::P2PSync(shared_ptr<Solver<Dtype> > root_solver,
   this->configure(solver_.get());
   solver_->add_callback(this);
 
-  if (parent) {
+  CUDA_CHECK(cudaSetDevice(initial_device));
+#else
+  NO_GPU;
+#endif
+}
+
+template<typename Dtype>
+void P2PSync<Dtype>::SetupP2PAccess() {
+#ifndef CPU_ONLY
+  int initial_device;
+  CUDA_CHECK(cudaGetDevice(&initial_device));
+  const int self = solver_->param().device_id();
+  CUDA_CHECK(cudaSetDevice(self));
+
+  cudaStreamCreateWithFlags(&cuda_stream_, cudaStreamNonBlocking);
+  //cuda_stream_ = cudaStreamDefault;
+  //cudaStreamCreate(&cuda_stream_);
+
+  if (parent_) {
     // Enable p2p access between devices
-    const int peer = parent->solver_->param().device_id();
+    const int peer = parent_->solver_->param().device_id();
     int access;
     CUDA_CHECK(cudaDeviceCanAccessPeer(&access, self, peer));
     if (access) {
       CUDA_CHECK(cudaDeviceEnablePeerAccess(peer, 0));
     } else {
-      LOG(INFO)<< "GPU " << self << " does not have p2p access to GPU " << peer;
+      CHECK(false) << "Fatal : P2P access is needed between all GPUs for pipeline";
     }
-    // Allocate receiving buffer on parent
-    CUDA_CHECK(cudaSetDevice(peer));
-    CUDA_CHECK(cudaMalloc(&parent_grads_, size_ * sizeof(Dtype)));
-    CUDA_CHECK(cudaSetDevice(self));
   }
 
+  CUDA_CHECK(cudaMalloc(&parent_grads_, size_ * sizeof(Dtype)));
+  CUDA_CHECK(cudaMalloc(&offset_, GRID_DIM*sizeof(int)));
+  CUDA_CHECK(cudaMemset(offset_, -1, GRID_DIM*sizeof(int)));
+
+  if (child_) {
+    const int peer = child_->solver_->param().device_id();
+    int access;
+    CUDA_CHECK(cudaDeviceCanAccessPeer(&access, self, peer));
+    if (access) {
+      CUDA_CHECK(cudaDeviceEnablePeerAccess(peer, 0));
+    } else {
+      CHECK(false) << "Fatal : P2P access is needed between all GPUs for pipeline";
+    }
+  }
   CUDA_CHECK(cudaSetDevice(initial_device));
 #else
   NO_GPU;
@@ -241,8 +214,16 @@ P2PSync<Dtype>::~P2PSync() {
   const int self = solver_->param().device_id();
   CUDA_CHECK(cudaSetDevice(self));
 
+  cudaStreamDestroy(cuda_stream_);
+  if (child_) {
+    const int peer = child_->solver_->param().device_id();
+    int access;
+    CUDA_CHECK(cudaDeviceCanAccessPeer(&access, self, peer));
+    if (access) {
+      CUDA_CHECK(cudaDeviceDisablePeerAccess(peer));
+    }
+  }
   if (parent_) {
-    CUDA_CHECK(cudaFree(parent_grads_));
     const int peer = parent_->solver_->param().device_id();
     int access;
     CUDA_CHECK(cudaDeviceCanAccessPeer(&access, self, peer));
@@ -272,153 +253,63 @@ void P2PSync<Dtype>::InternalThreadEntry() {
 }
 
 template<typename Dtype>
+void P2PSync<Dtype>::soft_barrier() {
+  // CPU barrier to avoid busy-polling on the GPU.
+  if (child_) queue_.pop();
+  if (parent_) parent_->queue_.push(this);
+  if (parent_) queue_.pop();
+  if (child_) child_->queue_.push(this);
+}
+
+template<typename Dtype>
 void P2PSync<Dtype>::on_start(Timer* timer, ostringstream* timing) {
 #ifndef CPU_ONLY
-#ifdef DEBUG
-  int device;
-  CUDA_CHECK(cudaGetDevice(&device));
-  CHECK(device == solver_->param().device_id());
-#else
-//  CHECK(false);
-#endif
-
-  // Wait for update from parent
-  if (parent_) {
-    timer->Start();
-    P2PSync<Dtype> *parent = queue_.pop();
-    CHECK(parent == parent_);
-    *timing << " recv_param: " << timer->MilliSeconds();
-  }
-
-  // Update children
-  if (children_.size()) {
-    timer->Start();
-  }
-  for (int i = 0; i < children_.size(); ++i) {
-    Dtype* src = data_;
-    Dtype* dst = children_[i]->data_;
-
-#ifdef DEBUG
-    cudaPointerAttributes attributes;
-    CUDA_CHECK(cudaPointerGetAttributes(&attributes, src));
-    CHECK(attributes.device == device);
-    CUDA_CHECK(cudaPointerGetAttributes(&attributes, dst));
-    CHECK(attributes.device == children_[i]->solver_->param().device_id());
-#endif
-
-    CUDA_CHECK(cudaMemcpyAsync(dst, src, size_ * sizeof(Dtype),  //
-        cudaMemcpyDeviceToDevice, cudaStreamDefault));
-  }
-  if (children_.size()) {
-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamDefault));
-  }
-  for (int i = 0; i < children_.size(); ++i) {
-    children_[i]->queue_.push(this);
-  }
-  if (children_.size()) {
-    *timing << " send_param: " << timer->MilliSeconds();
-  }
+  CUDA_CHECK(cudaStreamSynchronize(cudaStreamDefault));
+  multi_gpu_pipeline_bcast(
+    parent_ ? offset_ : NULL,
+    data_,
+    child_ ? child_->offset_ : NULL,
+    child_ ? child_->data_ : NULL,
+    size_,
+    GRID_DIM,
+    cuda_stream_);
+  CUDA_CHECK(cudaStreamSynchronize(cuda_stream_));
 #endif
 }
 
 template<typename Dtype>
 void P2PSync<Dtype>::on_gradients_ready(Timer* timer, ostringstream* timing) {
 #ifndef CPU_ONLY
-#ifdef DEBUG
-  int device;
-  CUDA_CHECK(cudaGetDevice(&device));
-  CHECK(device == solver_->param().device_id());
-#endif
-
-  // Sum children gradients as they appear in the queue
-  for (int i = 0; i < children_.size(); ++i) {
-    timer->Start();
-    P2PSync<Dtype> *child = queue_.pop();
-    Dtype* src = child->parent_grads_;
-    Dtype* dst = diff_;
-
-#ifdef DEBUG
-    bool ok = false;
-    for (int j = 0; j < children_.size(); ++j) {
-      if (child == children_[j]) {
-        ok = true;
-      }
-    }
-    CHECK(ok);
-    cudaPointerAttributes attributes;
-    CUDA_CHECK(cudaPointerGetAttributes(&attributes, src));
-    CHECK(attributes.device == device);
-    CUDA_CHECK(cudaPointerGetAttributes(&attributes, dst));
-    CHECK(attributes.device == device);
-#endif
-
-    caffe_gpu_add(size_, src, dst, dst);
-    *timing << " add_grad: " << timer->MilliSeconds();
-  }
-
-  // Send gradients to parent
-  if (parent_) {
-    timer->Start();
-    Dtype* src = diff_;
-    Dtype* dst = parent_grads_;
-
-#ifdef DEBUG
-    cudaPointerAttributes attributes;
-    CUDA_CHECK(cudaPointerGetAttributes(&attributes, src));
-    CHECK(attributes.device == device);
-    CUDA_CHECK(cudaPointerGetAttributes(&attributes, dst));
-    CHECK(attributes.device == parent_->solver_->param().device_id());
-#endif
-
-    CUDA_CHECK(cudaMemcpyAsync(dst, src, size_ * sizeof(Dtype),  //
-        cudaMemcpyDeviceToDevice, cudaStreamDefault));
-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamDefault));
-    parent_->queue_.push(this);
-    *timing << " send_grad: " << timer->MilliSeconds();
-  } else {
-    // Loss functions divide gradients by the batch size, so to compensate
-    // for split batch, the root solver divides by number of solvers.
-    caffe_gpu_scal(size_, Dtype(1.0 / Caffe::solver_count()), diff_);
-  }
+  CUDA_CHECK(cudaStreamSynchronize(cudaStreamDefault));
+  multi_gpu_pipeline_sum(
+    child_ ? offset_ : NULL,
+    diff_,
+    parent_grads_,
+    parent_ ? parent_->offset_ : NULL,
+    parent_ ? parent_->parent_grads_ : NULL,
+    (Dtype)1.0 / Caffe::solver_count(), // Mult factor
+    size_,
+    GRID_DIM,
+    cuda_stream_);
+  CUDA_CHECK(cudaStreamSynchronize(cuda_stream_));
 #endif
 }
 
 template<typename Dtype>
 void P2PSync<Dtype>::run(shared_ptr<Solver<Dtype> > root,
                          const vector<int>& gpus) {
-  // Pair devices for map-reduce synchronization
-  vector<DevicePair> pairs;
-  DevicePair::compute(gpus, &pairs);
-  ostringstream s;
-  for (int i = 1; i < pairs.size(); ++i) {
-    s << (i == 1 ? "" : ", ") << pairs[i].parent() << ":" << pairs[i].device();
-  }
-  LOG(INFO)<< "GPUs pairs " << s.str();
-
+  int nranks = gpus.size();
   SolverParameter param(root->param());
-  vector<shared_ptr<P2PSync<Dtype> > > syncs(gpus.size());
+  vector<shared_ptr<P2PSync<Dtype> > > syncs(nranks);
   syncs[0].reset(new P2PSync<Dtype>(root, NULL, param));
-
-  // Build the GPU tree by finding the parent for each solver
-  for (int attempts = 0; attempts < pairs.size(); ++attempts) {
-    for (int i = 1; i < pairs.size(); ++i) {
-      if (!syncs[i].get()) {
-        P2PSync<Dtype>* parent = NULL;
-        for (int j = 0; j < syncs.size(); ++j) {
-          if (syncs[j]) {
-            const SolverParameter& p = syncs[j]->solver()->param();
-            if (p.device_id() == pairs[i].parent()) {
-              parent = (P2PSync<Dtype>*) syncs[j].get();
-            }
-          }
-        }
-        if (parent) {
-          param.set_device_id(pairs[i].device());
-          syncs[i].reset(new P2PSync<Dtype>(root, parent, param));
-          parent->children_.push_back((P2PSync<Dtype>*) syncs[i].get());
-        }
-      }
-    }
+  for (int i = 1; i < nranks; i++) {
+    param.set_device_id(gpus[i]);
+    // Set parent_/child_
+    syncs[i].reset(new P2PSync<Dtype>(root, syncs[i-1].get(), param));
+    syncs[i-1].get()->child_=syncs[i].get();
+  }
+  for (int i = 0; i < syncs.size(); ++i) {
+    syncs[i]->SetupP2PAccess();
   }
 
   LOG(INFO)<< "Starting Optimization";
