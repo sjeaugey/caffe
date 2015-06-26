@@ -179,23 +179,21 @@ void P2PSync<Dtype>::SetupP2PAccess() {
   if (parent_) {
     // Enable p2p access between devices
     const int peer = parent_->solver_->param().device_id();
-    int access;
-    CUDA_CHECK(cudaDeviceCanAccessPeer(&access, self, peer));
-    if (access) {
+    CUDA_CHECK(cudaDeviceCanAccessPeer(&parent_peer_access_, self, peer));
+    if (parent_peer_access_) {
       CUDA_CHECK(cudaDeviceEnablePeerAccess(peer, 0));
     } else {
-      CHECK(false) << "Fatal : P2P access is needed between all GPUs for pipeline";
+      LOG(INFO)<< "GPU " << self << " does not have p2p access to GPU " << peer;
     }
   }
 
   if (child_) {
     const int peer = child_->solver_->param().device_id();
-    int access;
-    CUDA_CHECK(cudaDeviceCanAccessPeer(&access, self, peer));
-    if (access) {
+    CUDA_CHECK(cudaDeviceCanAccessPeer(&child_peer_access_, self, peer));
+    if (child_peer_access_) {
       CUDA_CHECK(cudaDeviceEnablePeerAccess(peer, 0));
     } else {
-      CHECK(false) << "Fatal : P2P access is needed between all GPUs for pipeline";
+      LOG(INFO)<< "GPU " << self << " does not have p2p access to GPU " << peer;
     }
   }
   CUDA_CHECK(cudaSetDevice(initial_device));
@@ -219,17 +217,13 @@ P2PSync<Dtype>::~P2PSync() {
 
   if (child_) {
     const int peer = child_->solver_->param().device_id();
-    int access;
-    CUDA_CHECK(cudaDeviceCanAccessPeer(&access, self, peer));
-    if (access) {
+    if (child_peer_access_) {
       CUDA_CHECK(cudaDeviceDisablePeerAccess(peer));
     }
   }
   if (parent_) {
     const int peer = parent_->solver_->param().device_id();
-    int access;
-    CUDA_CHECK(cudaDeviceCanAccessPeer(&access, self, peer));
-    if (access) {
+    if (parent_peer_access_) {
       CUDA_CHECK(cudaDeviceDisablePeerAccess(peer));
     }
   }
@@ -270,11 +264,24 @@ void P2PSync<Dtype>::on_start(Timer* timer, ostringstream* timing) {
   multi_gpu_pipeline_bcast(
     parent_ ? offset_ : NULL,
     data_,
-    child_ ? child_->offset_ : NULL,
-    child_ ? child_->data_ : NULL,
+    (child_ && child_peer_access_) ? child_->offset_ : NULL,
+    (child_ && child_peer_access_) ? child_->data_ : NULL,
     size_,
     GRID_DIM,
     cuda_stream_);
+  if (child_ && !child_peer_access_) {
+    int offset = -1;
+    while (offset != 0) { // Wait for receiver to be ready
+      CUDA_CHECK(cudaMemcpy(&offset, child_->offset_,
+            sizeof(int), cudaMemcpyDeviceToHost));
+    }
+    CUDA_CHECK(cudaMemcpyAsync(child_->data_, data_, 
+          size_ * sizeof(Dtype), cudaMemcpyDeviceToDevice, cuda_stream_));
+    for (int i = 0; i< GRID_DIM; i++) {
+      CUDA_CHECK(cudaMemcpyAsync(child_->offset_+i, &size_, 
+            sizeof(int), cudaMemcpyHostToDevice, cuda_stream_));
+    }
+  }
   CUDA_CHECK(cudaStreamSynchronize(cuda_stream_));
 #endif
 }
@@ -287,12 +294,25 @@ void P2PSync<Dtype>::on_gradients_ready(Timer* timer, ostringstream* timing) {
     child_ ? offset_ : NULL,
     diff_,
     parent_grads_,
-    parent_ ? parent_->offset_ : NULL,
-    parent_ ? parent_->parent_grads_ : NULL,
+    (parent_ && parent_peer_access_) ? parent_->offset_ : NULL,
+    (parent_ && parent_peer_access_) ? parent_->parent_grads_ : NULL,
     (Dtype)1.0 / Caffe::solver_count(), // Mult factor
     size_,
     GRID_DIM,
     cuda_stream_);
+  if (parent_ && !parent_peer_access_) {
+    int offset = -1;
+    while (offset != 0) { // Wait for receiver to be ready
+      CUDA_CHECK(cudaMemcpy(&offset, parent_->offset_,
+            sizeof(int), cudaMemcpyDeviceToHost));
+    }
+    CUDA_CHECK(cudaMemcpyAsync(parent_->parent_grads_, diff_, 
+          size_ * sizeof(Dtype), cudaMemcpyDeviceToDevice, cuda_stream_));
+    for (int i = 0; i< GRID_DIM; i++) {
+      CUDA_CHECK(cudaMemcpyAsync(parent_->offset_+i, &size_, 
+            sizeof(int), cudaMemcpyHostToDevice, cuda_stream_));
+    }
+  }
   CUDA_CHECK(cudaStreamSynchronize(cuda_stream_));
 #endif
 }
