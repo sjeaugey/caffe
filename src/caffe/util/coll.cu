@@ -7,16 +7,8 @@ template <typename Dtype>
 __global__ void pipeline_bcast_kernel(int* my_progress, Dtype* my_data, 
   int* next_progress, Dtype* next_data, const int size) {
   int tid = threadIdx.x;
-  if ((my_progress != NULL) && (tid == 0)) {
-    my_progress[blockIdx.x] = 0; // Signal receiver is ready
-  }
 
   int sync = SYNC_PERIOD;
-  // Wait for receiver to be ready
-  if (next_progress != NULL) {
-    if (tid == 0) while (((volatile int*)next_progress)[blockIdx.x] != 0) {}; 
-    __syncthreads();
-  }
 
   // Each block manages its portion of the buffer
   int block_size = (size+gridDim.x-1)/gridDim.x;
@@ -33,8 +25,10 @@ __global__ void pipeline_bcast_kernel(int* my_progress, Dtype* my_data,
       while ((progress = ((volatile int*)my_progress)[blockIdx.x]) < index) {}
       __threadfence_system();
     }
-    if (next_progress != NULL) {
+    if (next_data != NULL) {
       next_data[index] = my_data[index]; // Copy data
+    }
+    if (next_progress != NULL) {
       if (--sync == 0) {
         __syncthreads();
         if (tid == 0) {
@@ -60,16 +54,8 @@ __global__ void pipeline_sum_kernel(int* my_progress, Dtype* red_data,
   Dtype* my_data, int* next_progress, Dtype* next_data, Dtype factor,
   const int size) {
   int tid = threadIdx.x;
-  if ((my_progress != NULL) && (tid == 0)) {
-    my_progress[blockIdx.x] = 0; // Signal receiver is ready
-  }
 
   int sync = SYNC_PERIOD;
-  // Wait for receiver to be ready
-  if (next_progress != NULL) {
-    if (tid == 0) while (((volatile int*)next_progress)[blockIdx.x] != 0) {}; 
-    __syncthreads();
-  }
 
   // Each block manages its portion of the buffer
   int block_size = (size+gridDim.x-1)/gridDim.x;

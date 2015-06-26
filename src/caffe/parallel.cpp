@@ -174,7 +174,7 @@ void P2PSync<Dtype>::SetupP2PAccess() {
 
   CUDA_CHECK(cudaMalloc(&parent_grads_, size_ * sizeof(Dtype)));
   CUDA_CHECK(cudaMalloc(&offset_, GRID_DIM*sizeof(int)));
-  CUDA_CHECK(cudaMemset(offset_, -1, GRID_DIM*sizeof(int)));
+  CUDA_CHECK(cudaMemset(offset_, 0, GRID_DIM*sizeof(int)));
 
   if (parent_) {
     // Enable p2p access between devices
@@ -251,6 +251,7 @@ void P2PSync<Dtype>::InternalThreadEntry() {
 template<typename Dtype>
 void P2PSync<Dtype>::soft_barrier() {
   // CPU barrier to avoid busy-polling on the GPU.
+  CUDA_CHECK(cudaStreamSynchronize(cudaStreamDefault));
   if (child_) queue_.pop();
   if (parent_) parent_->queue_.push(this);
   if (parent_) queue_.pop();
@@ -270,11 +271,6 @@ void P2PSync<Dtype>::on_start(Timer* timer, ostringstream* timing) {
     GRID_DIM,
     cuda_stream_);
   if (child_ && !child_peer_access_) {
-    int offset = -1;
-    while (offset != 0) { // Wait for receiver to be ready
-      CUDA_CHECK(cudaMemcpy(&offset, child_->offset_,
-            sizeof(int), cudaMemcpyDeviceToHost));
-    }
     CUDA_CHECK(cudaMemcpyAsync(child_->data_, data_, 
           size_ * sizeof(Dtype), cudaMemcpyDeviceToDevice, cuda_stream_));
     for (int i = 0; i< GRID_DIM; i++) {
@@ -283,6 +279,8 @@ void P2PSync<Dtype>::on_start(Timer* timer, ostringstream* timing) {
     }
   }
   CUDA_CHECK(cudaStreamSynchronize(cuda_stream_));
+  CUDA_CHECK(cudaMemsetAsync(offset_, 0,
+        GRID_DIM * sizeof(int), cudaStreamDefault));
 #endif
 }
 
@@ -301,11 +299,6 @@ void P2PSync<Dtype>::on_gradients_ready(Timer* timer, ostringstream* timing) {
     GRID_DIM,
     cuda_stream_);
   if (parent_ && !parent_peer_access_) {
-    int offset = -1;
-    while (offset != 0) { // Wait for receiver to be ready
-      CUDA_CHECK(cudaMemcpy(&offset, parent_->offset_,
-            sizeof(int), cudaMemcpyDeviceToHost));
-    }
     CUDA_CHECK(cudaMemcpyAsync(parent_->parent_grads_, diff_, 
           size_ * sizeof(Dtype), cudaMemcpyDeviceToDevice, cuda_stream_));
     for (int i = 0; i< GRID_DIM; i++) {
@@ -314,6 +307,8 @@ void P2PSync<Dtype>::on_gradients_ready(Timer* timer, ostringstream* timing) {
     }
   }
   CUDA_CHECK(cudaStreamSynchronize(cuda_stream_));
+  CUDA_CHECK(cudaMemsetAsync(offset_, 0,
+            GRID_DIM * sizeof(int), cudaStreamDefault));
 #endif
 }
 
