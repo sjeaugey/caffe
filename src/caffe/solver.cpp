@@ -184,11 +184,14 @@ void Solver<Dtype>::Step(int iters) {
   Timer timer;
   ostringstream timing;
 
-  // We need to sync all threads before starting, otherwise some cuda init,
-  // malloc or other cuda stuff could interlock with in-loop cuda GPU sync
-  // called in on_start and on_gradients_ready.
   for (int i = 0; i < callbacks_.size(); ++i) {
+    // We need to sync all threads before starting, otherwise some cuda init,
+    // malloc or other cuda stuff could interlock with in-loop cuda GPU sync
+    // called in on_start.
     callbacks_[i]->soft_barrier();
+
+    // Initial broadcast of parameters
+    callbacks_[i]->on_start(&timer, &timing);
   }
 
   while (iter_ < stop_iter) {
@@ -206,9 +209,6 @@ void Solver<Dtype>::Step(int iters) {
     timing << "Timing ";
     if (param().solver_mode() == SolverParameter_SolverMode_GPU) {
       timing << "(device " << param().device_id() << ") ";
-    }
-    for (int i = 0; i < callbacks_.size(); ++i) {
-      callbacks_[i]->on_start(&timer, &timing);
     }
     const bool display = param_.display() && iter_ % param_.display() == 0;
     net_->set_debug_info(display && param_.debug_info());
@@ -249,9 +249,11 @@ void Solver<Dtype>::Step(int iters) {
       }
     }
     timing << " grads: " << timer.MilliSeconds();
+    timer.Start();
     for (int i = 0; i < callbacks_.size(); ++i) {
-      callbacks_[i]->on_gradients_ready(&timer, &timing);
+      callbacks_[i]->allreduce();
     }
+    timing << " allreduce: " << timer.MilliSeconds();
     timer.Start();
     Iteration();
     timing << " apply: " << timer.MilliSeconds();
@@ -513,9 +515,9 @@ void SGDSolver<Dtype>::ClipGradients() {
 
 template <typename Dtype>
 void SGDSolver<Dtype>::Iteration() {
-  CHECK(Caffe::root_solver());
   Dtype rate = GetLearningRate();
-  if (this->param_.display() && this->iter_ % this->param_.display() == 0) {
+  if (Caffe::root_solver() && 
+      this->param_.display() && this->iter_ % this->param_.display() == 0) {
     float lapse = iteration_timer_.Seconds();
     float per_s = (this->iter_ - iterations_last_) / (lapse ? lapse : 1);
     LOG(INFO) << "Iteration " << this->iter_ << " (" << per_s << "/s), "

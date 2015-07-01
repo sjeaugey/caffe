@@ -86,7 +86,7 @@ class P2PSync : public GPUParams<Dtype>, public Solver<Dtype>::Callback,
     public InternalThread {
  public:
   explicit P2PSync(shared_ptr<Solver<Dtype> > root_solver,
-                   P2PSync<Dtype>* parent, const SolverParameter& param);
+                   int rank, int nranks, const SolverParameter& param);
   virtual ~P2PSync();
 
   inline const shared_ptr<Solver<Dtype> >& solver() const {
@@ -103,10 +103,12 @@ class P2PSync : public GPUParams<Dtype>, public Solver<Dtype>::Callback,
 
   void soft_barrier();
   void on_start(Timer* timer, ostringstream* timing);
-  void on_gradients_ready(Timer* timer, ostringstream* timing);
+  void allreduce();
 
   void InternalThreadEntry();
 
+  const int rank_;
+  const int nranks_;
   P2PSync<Dtype>* parent_;
   P2PSync<Dtype>* child_;
   int parent_peer_access_;
