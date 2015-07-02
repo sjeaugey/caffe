@@ -10,6 +10,7 @@
 #include "caffe/util/io.hpp"
 #include "caffe/util/math_functions.hpp"
 #include "caffe/util/upgrade_proto.hpp"
+#include "caffe/util/reg_cmp.hpp"
 
 namespace caffe {
 
@@ -526,115 +527,61 @@ void SGDSolver<Dtype>::Iteration() {
     iterations_last_ = this->iter_;
   }
   ClipGradients();
-  for (int param_id = 0; param_id < this->net_->params().size(); ++param_id) {
-    Regularize(param_id);
-    ComputeUpdateValue(param_id, rate);
-  }
-  this->net_->Update();
-}
+  
+  // Regularize/Compute Net Params :
+  // L1 : hist_data[i]=diff[i]=(diff[i]+sign(data[i])*wdec)*lr+mom*hist_data[i]
+  // L2 : hist_data[i]=diff[i]=(diff[i]+data[i]*wdec)*lr+mom*hist_data[i]
+  //
+  // If there is no ownership between params, we can directly update data
+  // inside the reg_cmp function, i.e. do data[i] -= diff[i].
+  // Otherwise, we need to call net->Update().
 
-template <typename Dtype>
-void SGDSolver<Dtype>::Regularize(int param_id) {
   const vector<shared_ptr<Blob<Dtype> > >& net_params = this->net_->params();
-  const vector<float>& net_params_weight_decay =
-      this->net_->params_weight_decay();
-  Dtype weight_decay = this->param_.weight_decay();
-  string regularization_type = this->param_.regularization_type();
-  switch (Caffe::mode()) {
-  case Caffe::CPU: {
-    Dtype local_decay = weight_decay * net_params_weight_decay[param_id];
-    if (local_decay) {
-      if (regularization_type == "L2") {
-        // add weight decay
-        caffe_axpy(net_params[param_id]->count(),
-            local_decay,
-            net_params[param_id]->cpu_data(),
-            net_params[param_id]->mutable_cpu_diff());
-      } else if (regularization_type == "L1") {
-        caffe_cpu_sign(net_params[param_id]->count(),
-            net_params[param_id]->cpu_data(),
-            temp_[param_id]->mutable_cpu_data());
-        caffe_axpy(net_params[param_id]->count(),
-            local_decay,
-            temp_[param_id]->cpu_data(),
-            net_params[param_id]->mutable_cpu_diff());
-      } else {
-        LOG(FATAL) << "Unknown regularization type: " << regularization_type;
-      }
+  int reg_cmp_update = 1;
+  for (int param_id = 0; param_id < net_params.size(); ++param_id) {
+    if (this->net_->param_owners()[param_id] >= 0) {
+      reg_cmp_update = 0;
+      break;
     }
-    break;
   }
-  case Caffe::GPU: {
-#ifndef CPU_ONLY
-    Dtype local_decay = weight_decay * net_params_weight_decay[param_id];
-    if (local_decay) {
-      if (regularization_type == "L2") {
-        // add weight decay
-        caffe_gpu_axpy(net_params[param_id]->count(),
-            local_decay,
-            net_params[param_id]->gpu_data(),
-            net_params[param_id]->mutable_gpu_diff());
-      } else if (regularization_type == "L1") {
-        caffe_gpu_sign(net_params[param_id]->count(),
-            net_params[param_id]->gpu_data(),
-            temp_[param_id]->mutable_gpu_data());
-        caffe_gpu_axpy(net_params[param_id]->count(),
-            local_decay,
-            temp_[param_id]->gpu_data(),
-            net_params[param_id]->mutable_gpu_diff());
-      } else {
-        LOG(FATAL) << "Unknown regularization type: " << regularization_type;
-      }
-    }
-#else
-    NO_GPU;
-#endif
-    break;
-  }
-  default:
-    LOG(FATAL) << "Unknown caffe mode: " << Caffe::mode();
-  }
-}
-
-template <typename Dtype>
-void SGDSolver<Dtype>::ComputeUpdateValue(int param_id, Dtype rate) {
-  const vector<shared_ptr<Blob<Dtype> > >& net_params = this->net_->params();
-  const vector<float>& net_params_lr = this->net_->params_lr();
   Dtype momentum = this->param_.momentum();
-  switch (Caffe::mode()) {
-  case Caffe::CPU: {
-    // Compute the value to history, and then copy them to the blob's diff.
-    Dtype local_rate = rate * net_params_lr[param_id];
-
-    caffe_cpu_axpby(net_params[param_id]->count(), local_rate,
-              net_params[param_id]->cpu_diff(), momentum,
-              history_[param_id]->mutable_cpu_data());
-    // copy
-    caffe_copy(net_params[param_id]->count(),
-        history_[param_id]->cpu_data(),
-        net_params[param_id]->mutable_cpu_diff());
-    break;
-  }
-  case Caffe::GPU: {
+  string reg_type_str = this->param_.regularization_type();
+  int reg_type = reg_type_str == "L1" ? 1 : (reg_type_str == "L2" ? 2 : 0);
+  CHECK(reg_type) << "Unknown regularization type";
+  for (int param_id = 0; param_id < net_params.size(); ++param_id) {
+    Dtype weight_decay = this->param_.weight_decay() * this->net_->params_weight_decay()[param_id];
+    Dtype local_rate = rate * this->net_->params_lr()[param_id];
+    switch (Caffe::mode()) {
+      case Caffe::CPU:
+        caffe_cpu_reg_cmp(net_params[param_id]->count(),
+            net_params[param_id]->mutable_cpu_data(),
+            net_params[param_id]->mutable_cpu_diff(),
+            history_[param_id]->mutable_cpu_data(),
+            weight_decay,
+            local_rate,
+            momentum,
+            reg_type,
+            reg_cmp_update);
+        break;
+      case Caffe::GPU:
 #ifndef CPU_ONLY
-    // Compute the value to history, and then copy them to the blob's diff.
-    Dtype local_rate = rate * net_params_lr[param_id];
-
-    caffe_gpu_axpby(net_params[param_id]->count(), local_rate,
-              net_params[param_id]->gpu_diff(), momentum,
-              history_[param_id]->mutable_gpu_data());
-    // copy
-    caffe_copy(net_params[param_id]->count(),
-        history_[param_id]->gpu_data(),
-        net_params[param_id]->mutable_gpu_diff());
+        caffe_gpu_reg_cmp(net_params[param_id]->count(),
+            net_params[param_id]->mutable_gpu_data(),
+            net_params[param_id]->mutable_gpu_diff(),
+            history_[param_id]->mutable_gpu_data(),
+            weight_decay,
+            local_rate,
+            momentum,
+            reg_type,
+            reg_cmp_update,
+            cudaStreamDefault);
 #else
-    NO_GPU;
+        NO_GPU;
 #endif
-    break;
+        break;
+    }
   }
-  default:
-    LOG(FATAL) << "Unknown caffe mode: " << Caffe::mode();
-  }
+  if (reg_cmp_update == 0) this->net_->Update();
 }
 
 template <typename Dtype>

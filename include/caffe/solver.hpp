@@ -106,8 +106,6 @@ class SGDSolver : public Solver<Dtype> {
   void PreSolve();
   Dtype GetLearningRate();
   virtual void Iteration();
-  virtual void Regularize(int param_id);
-  virtual void ComputeUpdateValue(int param_id, Dtype rate);
   virtual void ClipGradients();
   virtual void SnapshotSolverState(SolverState * state);
   virtual void RestoreSolverState(const SolverState& state);
